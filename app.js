@@ -1,427 +1,218 @@
-/**
- * Module dependencies.
- */
+import express from 'express';
+import crypto from 'crypto';
+import bodyParser from 'body-parser';
+import zipcode from 'zipcode';
+import request from "request";
+import Wunderground from 'node-weatherunderground';
 
-var express = require('express'),
-    routes = require('./routes'),
-    user = require('./routes/user'),
-    http = require('http'),
-    path = require('path'),
-    fs = require('fs');
+// Watson Work Services URL
+const watsonWork = "https://api.watsonwork.ibm.com";
 
-var app = express();
+// Application Id, obtained from registering the application at https://developer.watsonwork.ibm.com
+const appId = process.env.WEATHER_CLIENT_ID;
 
-var db;
+// Application secret. Obtained from registration of application.
+const appSecret = process.env.WEATHER_CLIENT_SECRET;
 
-var cloudant;
+// Webhook secret. Obtained from registration of a webhook.
+const webhookSecret = process.env.WEATHER_WEBHOOK_SECRET;
 
-var fileToUpload;
+// Weather Underground API Key
+const weatherUndergroundKey = process.env.WEATHER_KEY;
 
-var dbCredentials = {
-    dbName: 'my_sample_db'
+// Keyword to "listen" for when receiving outbound webhook calls.
+const webhookKeyword = "@weather";
+
+const zipCodeError = (zc) => {
+  return `Hmm, I can't seem to find the weather for ${zc}`;
+}
+
+const failMessage =
+`Hey, it's foggy and I had issues retrieving the weather. Try again later`;
+
+const successMessage = (location, weather, temperature, winds, forcast_url) => {
+  return `Current conditions (powered by Wunderground, an IBM company) for _${location}_: ${weather}
+*Air temp* is ${temperature} and *winds* ${winds}
+Click [here](${forcast_url}) to learn more.`;
 };
 
-var bodyParser = require('body-parser');
-var methodOverride = require('method-override');
-var logger = require('morgan');
-var errorHandler = require('errorhandler');
-var multipart = require('connect-multiparty')
-var multipartMiddleware = multipart();
+const app = express();
+const client = new Wunderground(weatherUndergroundKey);
 
-// all environments
-app.set('port', process.env.PORT || 3000);
-app.set('views', __dirname + '/views');
-app.set('view engine', 'ejs');
-app.engine('html', require('ejs').renderFile);
-app.use(logger('dev'));
-app.use(bodyParser.urlencoded({
-    extended: true
-}));
-app.use(bodyParser.json());
-app.use(methodOverride());
-app.use(express.static(path.join(__dirname, 'public')));
-app.use('/style', express.static(path.join(__dirname, '/views/style')));
-
-// development only
-if ('development' == app.get('env')) {
-    app.use(errorHandler());
+// Send 200 and empty body for requests that won't be processed.
+const ignoreMessage = (res) => {
+  res.status(200).end();
 }
 
-function initDBConnection() {
-    //When running on Bluemix, this variable will be set to a json object
-    //containing all the service credentials of all the bound services
-    if (process.env.VCAP_SERVICES) {
-        var vcapServices = JSON.parse(process.env.VCAP_SERVICES);
-        // Pattern match to find the first instance of a Cloudant service in
-        // VCAP_SERVICES. If you know your service key, you can access the
-        // service credentials directly by using the vcapServices object.
-        for (var vcapService in vcapServices) {
-            if (vcapService.match(/cloudant/i)) {
-                dbCredentials.url = vcapServices[vcapService][0].credentials.url;
-            }
-        }
-    } else { //When running locally, the VCAP_SERVICES will not be set
+// Process webhook verification requests
+const verifyCallback = (req, res) => {
+  console.log("Verifying challenge");
 
-        // When running this app locally you can get your Cloudant credentials
-        // from Bluemix (VCAP_SERVICES in "cf env" output or the Environment
-        // Variables section for an app in the Bluemix console dashboard).
-        // Alternately you could point to a local database here instead of a
-        // Bluemix service.
-        // url will be in this format: https://username:password@xxxxxxxxx-bluemix.cloudant.com
-        dbCredentials.url = "REPLACE ME";
+  const bodyToSend = {
+    response: req.body.challenge
+  };
+
+  // Create a HMAC-SHA256 hash of the recieved body, using the webhook secret
+  // as the key, to confirm webhook endpoint.
+  const hashToSend =
+    crypto.createHmac('sha256', webhookSecret)
+    .update(JSON.stringify(bodyToSend))
+    .digest('hex');
+
+  res.set('X-OUTBOUND-TOKEN', hashToSend);
+  res.send(bodyToSend).end();
+};
+
+// Validate events coming through and process only message-created or verification events.
+const validateEvent = (req, res, next) => {
+
+  // Event to Event Handler mapping
+  const processEvent = {
+    'verification': verifyCallback,
+    'message-created': () => next()
+  };
+
+  // If event exists in processEvent, execute handler. If not, ignore message.
+  return (processEvent[req.body.type]) ?
+    processEvent[req.body.type](req, res) : ignoreMessage(res);
+};
+
+// Authenticate Application
+const authenticateApp = (callback) => {
+
+  // Authentication API
+  const authenticationAPI = 'oauth/token';
+
+  const authenticationOptions = {
+    "method": "POST",
+    "url": `${watsonWork}/${authenticationAPI}`,
+    "auth": {
+      "user": appId,
+      "pass": appSecret
+    },
+    "form": {
+      "grant_type": "client_credentials"
     }
+  };
 
-    cloudant = require('cloudant')(dbCredentials.url);
+  request(authenticationOptions, (err, response, body) => {
+    // If can't authenticate just return
+    if (response.statusCode != 200) {
+      console.log("Error authentication application. Exiting.");
+      process.exit(1);
+    }
+    callback(JSON.parse(body).access_token);
+  });
+};
 
-    // check if DB exists if not create
-    cloudant.db.create(dbCredentials.dbName, function(err, res) {
-        if (err) {
-            console.log('Could not create new db: ' + dbCredentials.dbName + ', it might already exist.');
-        }
-    });
+// Send message to Watson Workspace
+const sendMessage = (spaceId, message) => {
 
-    db = cloudant.use(dbCredentials.dbName);
-}
+  // Spaces API
+  const spacesAPI = `v1/spaces/${spaceId}/messages`;
 
-initDBConnection();
+  // Photos API
+  const photosAPI = `photos`;
 
-app.get('/', routes.index);
+  // Format for sending messages to Workspace
+  const messageData = {
+    type: "appMessage",
+    version: 1.0,
+    annotations: [
+      {
+        type: "generic",
+        version: 1.0,
+        color: "#D5212B",
+        title: "Current weather conditions",
+        text: message
+      }
+    ]
+  };
 
-function createResponseData(id, name, value, attachments) {
+  // Authenticate application and send message.
+  authenticateApp( (jwt) => {
 
-    var responseData = {
-        id: id,
-        name: name,
-        value: value,
-        attachements: []
+    const sendMessageOptions = {
+      "method": "POST",
+      "url": `${watsonWork}/${spacesAPI}`,
+      "headers": {
+        "Authorization": `Bearer ${jwt}`
+      },
+      "json": messageData
     };
 
-
-    attachments.forEach(function(item, index) {
-        var attachmentData = {
-            content_type: item.type,
-            key: item.key,
-            url: '/api/favorites/attach?id=' + id + '&key=' + item.key
-        };
-        responseData.attachements.push(attachmentData);
-
+    request(sendMessageOptions, (err, response, body) => {
+      if(response.statusCode != 201) {
+        console.log("Error posting weather information.");
+        console.log(response.statusCode);
+        console.log(err);
+      }
     });
-    return responseData;
-}
+  });
+};
 
+// Ensure we can parse JSON when listening to requests
+app.use(bodyParser.json());
 
-var saveDocument = function(id, name, value, response) {
+app.get('/', (req, res) => {
+  res.send('IBM Watson Workspace weather bot is alive and happy!');
+});
 
-    if (id === undefined) {
-        // Generated random id
-        id = '';
+// This is callback URI that Watson Workspace will call when there's a new message created
+app.post('/webhook', validateEvent, (req, res) => {
+
+  // Check if the first part of the message is '@weather'.
+  // This lets us "listen" for the '@weather' keyword.
+  if (req.body.content.indexOf(webhookKeyword) != 0) {
+    ignoreMessage(res);
+    return;
+  }
+
+  // Send status back to Watson Work to confirm receipt of message
+  res.status(200).end();
+
+  // Id of space where outbound event originated from.
+  const spaceId = req.body.spaceId;
+
+  // Parse zipcode from message body.
+  // Expected format: <keyword> <zipcode>
+  const zc = req.body.content.split(' ')[1];
+  console.log('Getting weather for zipcode: \'' + zc + '\'');
+
+  const cityState = zipcode.lookup(zc);
+
+  // If lookup fails, send failure message to space.
+  if (!cityState) {
+    sendMessage(spaceId, zipCodeError(zc));
+    return;
+  }
+
+  console.log('Looking up weather for: ' + cityState[0] + ', ' + cityState[1]);
+
+  const opts = {
+    city: cityState[0],
+    state: cityState[1]
+  }
+
+  client.conditions(opts, function(err, data) {
+
+    // If error, send message to Watson Workspace with failure message
+    if (err) {
+      sendMessage(spaceId, failMessage, res);
+      return ;
     }
 
-    db.insert({
-        name: name,
-        value: value
-    }, id, function(err, doc) {
-        if (err) {
-            console.log(err);
-            response.sendStatus(500);
-        } else
-            response.sendStatus(200);
-        response.end();
-    });
+    console.log("Posting current weather conditions back to space");
+    sendMessage(spaceId, successMessage(data.display_location.full,
+      data.weather, data.temperature_string, data.wind_string, data.forecast_url)
+    );
+    return;
+  });
 
-}
-
-app.get('/api/favorites/attach', function(request, response) {
-    var doc = request.query.id;
-    var key = request.query.key;
-
-    db.attachment.get(doc, key, function(err, body) {
-        if (err) {
-            response.status(500);
-            response.setHeader('Content-Type', 'text/plain');
-            response.write('Error: ' + err);
-            response.end();
-            return;
-        }
-
-        response.status(200);
-        response.setHeader("Content-Disposition", 'inline; filename="' + key + '"');
-        response.write(body);
-        response.end();
-        return;
-    });
-});
-
-app.post('/api/favorites/attach', multipartMiddleware, function(request, response) {
-
-    console.log("Upload File Invoked..");
-    console.log('Request: ' + JSON.stringify(request.headers));
-
-    var id;
-
-    db.get(request.query.id, function(err, existingdoc) {
-
-        var isExistingDoc = false;
-        if (!existingdoc) {
-            id = '-1';
-        } else {
-            id = existingdoc.id;
-            isExistingDoc = true;
-        }
-
-        var name = request.query.name;
-        var value = request.query.value;
-
-        var file = request.files.file;
-        var newPath = './public/uploads/' + file.name;
-
-        var insertAttachment = function(file, id, rev, name, value, response) {
-
-            fs.readFile(file.path, function(err, data) {
-                if (!err) {
-
-                    if (file) {
-
-                        db.attachment.insert(id, file.name, data, file.type, {
-                            rev: rev
-                        }, function(err, document) {
-                            if (!err) {
-                                console.log('Attachment saved successfully.. ');
-
-                                db.get(document.id, function(err, doc) {
-                                    console.log('Attachements from server --> ' + JSON.stringify(doc._attachments));
-
-                                    var attachements = [];
-                                    var attachData;
-                                    for (var attachment in doc._attachments) {
-                                        if (attachment == value) {
-                                            attachData = {
-                                                "key": attachment,
-                                                "type": file.type
-                                            };
-                                        } else {
-                                            attachData = {
-                                                "key": attachment,
-                                                "type": doc._attachments[attachment]['content_type']
-                                            };
-                                        }
-                                        attachements.push(attachData);
-                                    }
-                                    var responseData = createResponseData(
-                                        id,
-                                        name,
-                                        value,
-                                        attachements);
-                                    console.log('Response after attachment: \n' + JSON.stringify(responseData));
-                                    response.write(JSON.stringify(responseData));
-                                    response.end();
-                                    return;
-                                });
-                            } else {
-                                console.log(err);
-                            }
-                        });
-                    }
-                }
-            });
-        }
-
-        if (!isExistingDoc) {
-            existingdoc = {
-                name: name,
-                value: value,
-                create_date: new Date()
-            };
-
-            // save doc
-            db.insert({
-                name: name,
-                value: value
-            }, '', function(err, doc) {
-                if (err) {
-                    console.log(err);
-                } else {
-
-                    existingdoc = doc;
-                    console.log("New doc created ..");
-                    console.log(existingdoc);
-                    insertAttachment(file, existingdoc.id, existingdoc.rev, name, value, response);
-
-                }
-            });
-
-        } else {
-            console.log('Adding attachment to existing doc.');
-            console.log(existingdoc);
-            insertAttachment(file, existingdoc._id, existingdoc._rev, name, value, response);
-        }
-
-    });
 
 });
 
-app.post('/api/favorites', function(request, response) {
-
-    console.log("Create Invoked..");
-    console.log("Name: " + request.body.name);
-    console.log("Value: " + request.body.value);
-
-    // var id = request.body.id;
-    var name = request.body.name;
-    var value = request.body.value;
-
-    saveDocument(null, name, value, response);
-
-});
-
-app.delete('/api/favorites', function(request, response) {
-
-    console.log("Delete Invoked..");
-    var id = request.query.id;
-    // var rev = request.query.rev; // Rev can be fetched from request. if
-    // needed, send the rev from client
-    console.log("Removing document of ID: " + id);
-    console.log('Request Query: ' + JSON.stringify(request.query));
-
-    db.get(id, {
-        revs_info: true
-    }, function(err, doc) {
-        if (!err) {
-            db.destroy(doc._id, doc._rev, function(err, res) {
-                // Handle response
-                if (err) {
-                    console.log(err);
-                    response.sendStatus(500);
-                } else {
-                    response.sendStatus(200);
-                }
-            });
-        }
-    });
-
-});
-
-app.put('/api/favorites', function(request, response) {
-
-    console.log("Update Invoked..");
-
-    var id = request.body.id;
-    var name = request.body.name;
-    var value = request.body.value;
-
-    console.log("ID: " + id);
-
-    db.get(id, {
-        revs_info: true
-    }, function(err, doc) {
-        if (!err) {
-            console.log(doc);
-            doc.name = name;
-            doc.value = value;
-            db.insert(doc, doc.id, function(err, doc) {
-                if (err) {
-                    console.log('Error inserting data\n' + err);
-                    return 500;
-                }
-                return 200;
-            });
-        }
-    });
-});
-
-app.get('/api/favorites', function(request, response) {
-
-    console.log("Get method invoked.. ")
-
-    db = cloudant.use(dbCredentials.dbName);
-    var docList = [];
-    var i = 0;
-    db.list(function(err, body) {
-        if (!err) {
-            var len = body.rows.length;
-            console.log('total # of docs -> ' + len);
-            if (len == 0) {
-                // push sample data
-                // save doc
-                var docName = 'sample_doc';
-                var docDesc = 'A sample Document';
-                db.insert({
-                    name: docName,
-                    value: 'A sample Document'
-                }, '', function(err, doc) {
-                    if (err) {
-                        console.log(err);
-                    } else {
-
-                        console.log('Document : ' + JSON.stringify(doc));
-                        var responseData = createResponseData(
-                            doc.id,
-                            docName,
-                            docDesc, []);
-                        docList.push(responseData);
-                        response.write(JSON.stringify(docList));
-                        console.log(JSON.stringify(docList));
-                        console.log('ending response...');
-                        response.end();
-                    }
-                });
-            } else {
-
-                body.rows.forEach(function(document) {
-
-                    db.get(document.id, {
-                        revs_info: true
-                    }, function(err, doc) {
-                        if (!err) {
-                            if (doc['_attachments']) {
-
-                                var attachments = [];
-                                for (var attribute in doc['_attachments']) {
-
-                                    if (doc['_attachments'][attribute] && doc['_attachments'][attribute]['content_type']) {
-                                        attachments.push({
-                                            "key": attribute,
-                                            "type": doc['_attachments'][attribute]['content_type']
-                                        });
-                                    }
-                                    console.log(attribute + ": " + JSON.stringify(doc['_attachments'][attribute]));
-                                }
-                                var responseData = createResponseData(
-                                    doc._id,
-                                    doc.name,
-                                    doc.value,
-                                    attachments);
-
-                            } else {
-                                var responseData = createResponseData(
-                                    doc._id,
-                                    doc.name,
-                                    doc.value, []);
-                            }
-
-                            docList.push(responseData);
-                            i++;
-                            if (i >= len) {
-                                response.write(JSON.stringify(docList));
-                                console.log('ending response...');
-                                response.end();
-                            }
-                        } else {
-                            console.log(err);
-                        }
-                    });
-
-                });
-            }
-
-        } else {
-            console.log(err);
-        }
-    });
-
-});
-
-
-http.createServer(app).listen(app.get('port'), '0.0.0.0', function() {
-    console.log('Express server listening on port ' + app.get('port'));
+// Kickoff the main process to listen to incoming requests
+app.listen(process.env.PORT || 3000, () => {
+  console.log('Weather app is listening on the port');
 });
